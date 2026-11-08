@@ -98,7 +98,9 @@ jobs:
           build-args: VERSION=${{ needs.version.outputs.version }}
           tags: ${{ steps.image.outputs.name }}:${{ needs.version.outputs.version }}
           cache-from: type=gha,scope=${{ matrix.app }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+          # GitHub may hand this job a read-only cache token (seen on merges into
+          # main), so a failed cache upload must not fail the build itself.
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }},ignore-error=true
 
   tag:
     name: Create git tag
