@@ -4,8 +4,9 @@ name: Release
 # A PR commit with subject "version(application): X.Y.Z[-suffix]" overrides the bump.
 #
 # Stages run strictly in order; each one must succeed for the next to start:
-#   version -> build -> tag -> release (main only)
-#                           -> push-images (disabled)
+#   version -> build -> tag          (development only)
+#                    -> release      (main only; gh creates the tag itself)
+#                    -> push-images  (disabled; runs after tag/release)
 
 on:
   pull_request:
@@ -105,6 +106,9 @@ jobs:
   tag:
     name: Create git tag
     needs: [version, build]
+    # Only PRs merged into development get a standalone git tag; on main the
+    # tag is created by the release job.
+    if: github.event.pull_request.base.ref == 'development'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -126,7 +130,7 @@ jobs:
 
   release:
     name: Create GitHub release
-    needs: [version, tag]
+    needs: [version, build]
     # Only PRs merged into main produce a GitHub release.
     if: github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
@@ -138,9 +142,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           VERSION: ${{ needs.version.outputs.version }}
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        # The tag does not exist yet: gh creates it on the merge commit.
         # Versions with a suffix (e.g. 1.2.3-alpha) are marked as pre-releases.
         run: |
-          args=(--repo "${REPO}" --title "${VERSION}" --generate-notes --verify-tag)
+          args=(--repo "${REPO}" --title "${VERSION}" --generate-notes --target "${SHA}")
           if [[ "${VERSION}" == *-* ]]; then
             args+=(--prerelease)
           fi
@@ -148,10 +154,15 @@ jobs:
 
   push-images:
     name: Push images
-    needs: [version, tag]
+    needs: [version, build, tag, release]
     # Skipped by default: this is a sandbox project, images are not published.
     # Set the repository variable PUSH_IMAGES=true to enable this stage.
-    if: vars.PUSH_IMAGES == 'true'
+    # Only one of tag/release runs per merge, so a skipped one must not block this.
+    if: >-
+      !cancelled()
+      && !contains(needs.*.result, 'failure')
+      && needs.version.result == 'success'
+      && vars.PUSH_IMAGES == 'true'
     runs-on: ubuntu-latest
     permissions:
       packages: write
