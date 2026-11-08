@@ -1,0 +1,168 @@
+name: Release
+
+# Runs when a PR is merged into main (minor bump) or development (patch bump).
+# A PR commit with subject "version(application): X.Y.Z[-suffix]" overrides the bump.
+#
+# Stages run strictly in order; each one must succeed for the next to start:
+#   version -> build -> tag -> release (main only)
+#                           -> push-images (disabled)
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main, development]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Calculate version
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: backend/.python-version
+
+      - name: Get PR commit messages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        # Messages are separated by the ASCII record separator (\u001e) so
+        # multi-line commit messages stay intact.
+        run: |
+          gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" \
+            --jq '.[] | .commit.message + "\u001e"' > "${RUNNER_TEMP}/commits.txt"
+
+      - name: Calculate version
+        id: calc
+        env:
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: |
+          python .github/scripts/calculate_version.py \
+            --branch "${BASE_BRANCH}" \
+            --commits "${RUNNER_TEMP}/commits.txt"
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.calc.outputs.version }}
+        run: |
+          echo "### Version: \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.app }} image
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        app: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      # Docker image names must be lowercase; the GitHub owner name may not be.
+      - name: Compute image name
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          APP: ${{ matrix.app }}
+        run: |
+          owner="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${owner}/test_actions-${APP}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./${{ matrix.app }}
+          push: false
+          build-args: VERSION=${{ needs.version.outputs.version }}
+          tags: ${{ steps.image.outputs.name }}:${{ needs.version.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+  tag:
+    name: Create git tag
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Create and push tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${VERSION}" "${SHA}" -m "Release ${VERSION} (PR #${PR_NUMBER})"
+          git push origin "refs/tags/${VERSION}"
+
+  release:
+    name: Create GitHub release
+    needs: [version, tag]
+    # Only PRs merged into main produce a GitHub release.
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        # Versions with a suffix (e.g. 1.2.3-alpha) are marked as pre-releases.
+        run: |
+          args=(--repo "${REPO}" --title "${VERSION}" --generate-notes --verify-tag)
+          if [[ "${VERSION}" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${VERSION}" "${args[@]}"
+
+  push-images:
+    name: Push images
+    needs: [version, tag]
+    # Skipped by default: this is a sandbox project, images are not published.
+    # Set the repository variable PUSH_IMAGES=true to enable this stage.
+    if: vars.PUSH_IMAGES == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - run: echo "Would push images tagged ${{ needs.version.outputs.version }}"
+      # - uses: docker/login-action@v4
+      #   with:
+      #     registry: ghcr.io
+      #     username: ${{ github.actor }}
+      #     password: ${{ github.token }}
+      # - uses: docker/build-push-action@v7
+      #   with:
+      #     context: ./backend
+      #     push: true
+      #     # Image name must be lowercase (see "Compute image name" in the build job).
+      #     tags: ghcr.io/<lowercase-owner>/test_actions-backend:${{ needs.version.outputs.version }}
